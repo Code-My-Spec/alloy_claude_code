@@ -33,6 +33,28 @@ defmodule AlloyClaudeCodeTest do
       assert result.response_metadata.total_cost_usd == 0.001
     end
 
+    test ":env reaches the CLI as its environment, functions called, and only when set" do
+      parent = self()
+      reply = {envelope(%{"stop_reason" => "end_turn", "text" => "ok", "tool_calls" => []}), 0}
+
+      runner =
+        fake_runner(fn _args, opts ->
+          send(parent, {:opts, opts})
+          reply
+        end)
+
+      env = [{"CLAUDE_CODE_OAUTH_TOKEN", fn -> "token-value" end}, {"OTHER", "plain"}]
+      config = %{model: "claude-sonnet-5", command_runner: runner, env: env}
+      assert {:ok, _} = AlloyClaudeCode.complete([Message.user("Hi")], [], config)
+      assert_received {:opts, opts}
+      assert opts[:env] == [{"CLAUDE_CODE_OAUTH_TOKEN", "token-value"}, {"OTHER", "plain"}]
+
+      config = %{model: "claude-sonnet-5", command_runner: runner}
+      assert {:ok, _} = AlloyClaudeCode.complete([Message.user("Hi")], [], config)
+      assert_received {:opts, opts}
+      refute Keyword.has_key?(opts, :env)
+    end
+
     # Taken from a real reply: the model's StructuredOutput call held the
     # literal two characters `\n` and rendered as one line.
     test "a reply the model escaped twice arrives with its line breaks" do

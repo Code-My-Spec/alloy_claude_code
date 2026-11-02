@@ -23,6 +23,11 @@ defmodule AlloyClaudeCode do
     *same* stable directory on every call for one conversation to get the
     `--resume` cache benefit described below - the default (fresh temp dir
     per call) makes `--resume` correct but free of any cost benefit.
+  - `:env` - Extra `{name, value}` variables for the CLI's environment, set
+    through the port rather than the command line (for example
+    `CLAUDE_CODE_OAUTH_TOKEN` for a service with no Claude login). A value
+    may be a zero-arity function, called at spawn, to keep a secret out of
+    an inspected config
   - `:config_dir` - Override `CLAUDE_CONFIG_DIR` for the invocation. Not set
     by default - see the macOS note below.
   - `:settings_path` - Passed through as `--settings <path>` when present
@@ -150,7 +155,7 @@ defmodule AlloyClaudeCode do
 
   alias Alloy.Message
   alias Alloy.Provider.Error
-  alias AlloyClaudeCode.{OSProcess, Session, StreamJson}
+  alias AlloyClaudeCode.{Launch, OSProcess, Session, StreamJson}
 
   @default_timeout_ms 120_000
   @default_max_run_ms :timer.minutes(30)
@@ -199,6 +204,7 @@ defmodule AlloyClaudeCode do
           optional(:claude_bin) => String.t(),
           optional(:workdir) => String.t(),
           optional(:config_dir) => String.t(),
+          optional(:env) => [{String.t(), String.t() | (-> String.t())}],
           optional(:settings_path) => String.t(),
           optional(:tmp_dir) => String.t(),
           optional(:timeout_ms) => pos_integer(),
@@ -371,6 +377,7 @@ defmodule AlloyClaudeCode do
       base_dir: base_dir,
       prompt_path: Path.join(base_dir, "prompt.txt"),
       stderr_path: Path.join(base_dir, "stderr.txt"),
+      system_prompt_path: Path.join(base_dir, "system_prompt.txt"),
       workdir: Map.get(config, :workdir, base_dir),
       config_dir: Map.get(config, :config_dir)
     }
@@ -412,11 +419,19 @@ defmodule AlloyClaudeCode do
     if injected_runner?(config) do
       run_injected(config, executable, args, paths, stream)
     else
-      run_port(executable, args, paths, {timeout, max_run(config)}, stream)
+      run_port(executable, args, paths, {timeout, max_run(config)}, stream, env(config))
     end
   end
 
   defp max_run(config), do: Map.get(config, :max_run_ms, @default_max_run_ms)
+
+  # A function value is called here, at spawn, so a secret held in one never
+  # shows in an inspected config or crash report.
+  defp env(config) do
+    for {key, value} <- Map.get(config, :env) || [] do
+      {key, if(is_function(value, 0), do: value.(), else: value)}
+    end
+  end
 
   defp effective_timeout(config) do
     timeout_ms = Map.get(config, :timeout_ms, @default_timeout_ms)
@@ -436,7 +451,12 @@ defmodule AlloyClaudeCode do
   # payload comes back on stdout itself.
   defp run_injected(config, executable, args, paths, stream) do
     runner = Map.fetch!(config, :command_runner)
-    opts = [cd: paths.workdir, stderr_to_stdout: false]
+
+    opts =
+      case env(config) do
+        [] -> [cd: paths.workdir, stderr_to_stdout: false]
+        env -> [cd: paths.workdir, stderr_to_stdout: false, env: env]
+      end
 
     case runner.(executable, args, opts) do
       {output, status} when is_binary(output) and is_integer(status) ->
@@ -451,68 +471,51 @@ defmodule AlloyClaudeCode do
   end
 
   # Real path: spawn via Port so we capture the OS pid and can kill the
-  # subprocess on timeout. `exec env ... claude ...` makes the shell process
-  # replace itself with env, which replaces itself with claude - so
-  # `Port.info(:os_pid)` returns claude's own pid rather than a shell pid
-  # whose children we'd otherwise orphan.
+  # subprocess on timeout. How it is launched, per OS, is `Launch`.
   #
-  # stderr is redirected to a file by the shell command itself (not merged
-  # into stdout via Port options) so that stray diagnostic output can never
-  # corrupt the single JSON result object `--output-format json` writes to
-  # stdout.
-  defp run_port(executable, args, paths, {timeout, max_run}, stream) do
-    shell_command = build_port_command(executable, args, paths)
+  # stderr is redirected to a file by the launching shell (not merged into
+  # stdout via Port options) so that stray diagnostic output can never
+  # corrupt the stream-json claude writes to stdout.
+  defp run_port(executable, args, paths, {timeout, max_run}, stream, env) do
+    os = :os.type()
+    {args, files} = Launch.file_args(os, args, paths)
 
-    port =
-      Port.open(
-        {:spawn_executable, "/bin/sh"},
-        [
-          {:args, ["-lc", shell_command]},
-          {:cd, paths.workdir},
-          :binary,
-          :exit_status,
-          :use_stdio
-        ]
-      )
+    with :ok <- write_files(files),
+         {:ok, {name, opts}} <- Launch.port_spec(os, executable, args, paths, env) do
+      port = Port.open(name, opts)
 
-    # Port.info/2 returns nil when the process already exited - its output
-    # and exit_status messages are still in the mailbox, so collect them;
-    # there is just no OS pid left to kill on timeout.
-    now = System.monotonic_time(:millisecond)
+      # Port.info/2 returns nil when the process already exited - its output
+      # and exit_status messages are still in the mailbox, so collect them;
+      # there is just no OS pid left to kill on timeout.
+      now = System.monotonic_time(:millisecond)
 
-    limits = %{
-      idle: timeout,
-      quiet_until: now + timeout,
-      max_run: max_run,
-      run_until: now + max_run
-    }
+      limits = %{
+        idle: timeout,
+        quiet_until: now + timeout,
+        max_run: max_run,
+        run_until: now + max_run
+      }
 
-    os_pid =
-      case Port.info(port, :os_pid) do
-        {:os_pid, os_pid} -> os_pid
-        nil -> nil
-      end
+      os_pid =
+        case Port.info(port, :os_pid) do
+          {:os_pid, os_pid} -> os_pid
+          nil -> nil
+        end
 
-    collect_port(port, os_pid, limits, [], stream)
+      collect_port(port, os_pid, limits, [], stream)
+    end
   rescue
     error in ErlangError ->
       {:error, "claude exec failed to start: #{Exception.message(error)}"}
   end
 
-  defp build_port_command(executable, args, paths) do
-    env_args =
-      [{"CLAUDE_CONFIG_DIR", paths.config_dir}]
-      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
-      |> Enum.map_join(" ", fn {key, value} -> shell_escape("#{key}=#{value}") end)
-
-    "exec env " <>
-      env_args <>
-      " " <>
-      Enum.map_join([executable | args], " ", &shell_escape/1) <>
-      " < " <>
-      shell_escape(paths.prompt_path) <>
-      " 2> " <>
-      shell_escape(paths.stderr_path)
+  defp write_files(files) do
+    Enum.reduce_while(files, :ok, fn {path, content}, :ok ->
+      case File.write(path, content) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, "failed to write #{path}: #{inspect(reason)}"}}
+      end
+    end)
   end
 
   # Two limits. `:timeout_ms` is how long the CLI may go without writing
@@ -1043,10 +1046,6 @@ defmodule AlloyClaudeCode do
   end
 
   defp maybe_append_resume(args, :fresh), do: args
-
-  defp shell_escape(value) when is_binary(value) do
-    "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
-  end
 
   # `limit` is a character budget, not a byte budget - `String.slice/3`
   # respects grapheme boundaries so we never split a multibyte codepoint
