@@ -72,7 +72,7 @@ defmodule AlloyClaudeCode.LaunchTest do
       assert line ==
                ~S(cmd.exe /d /s /c ""C:\Users\a b\.local\bin\claude.exe" -p < "C:\Temp\run\prompt.txt" 2> "C:\Temp\run\stderr.txt"")
 
-      assert opts == [{:cd, ~S(C:\work)}, :binary, :exit_status, :use_stdio]
+      assert opts == [{:cd, ~S(C:\work)}, :binary, :exit_status, :use_stdio, :hide]
     end
 
     test "sets the config dir and env through the port" do

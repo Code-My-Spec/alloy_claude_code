@@ -27,7 +27,10 @@ defmodule AlloyClaudeCode.Launch do
   def port_spec({:win32, _}, executable, args, paths, env) do
     with {:ok, line} <- windows_command(executable, args, paths) do
       env = [{"CLAUDE_CONFIG_DIR", Map.get(paths, :config_dir)} | env]
-      {:ok, {{:spawn, line}, base_opts(paths) ++ env_opt(env)}}
+      # `:hide` gives the child a hidden console. Without one, claude.exe
+      # writes nothing at all (not even to a redirected file) and a full run
+      # exits 1, so every turn under a Windows service failed with no output.
+      {:ok, {{:spawn, line}, base_opts(paths) ++ [:hide] ++ env_opt(env)}}
     end
   end
 
